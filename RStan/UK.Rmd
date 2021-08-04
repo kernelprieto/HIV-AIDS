@@ -1,0 +1,616 @@
+
+```{r setup, include=FALSE}
+library(deSolve)
+library(dplyr)
+library(rstan)
+library(outbreaks)
+library(bayesplot)
+#library(rstanarm)
+
+rstan_options(auto_write = TRUE)           
+options(mc.cores = parallel::detectCores())
+
+knitr::opts_chunk$set(cache = TRUE, echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+
+
+```{r load_flu_data, echo = TRUE}
+#onset <- influenza_england_1978_school$date    
+#cases <- influenza_england_1978_school$in_bed  #Number of students in bed
+file='UK-HIV-AIDS.csv'
+dataHIV = read.csv(file,header=FALSE)
+
+hiv_data =dataHIV$V2
+aids_data=dataHIV$V3
+
+N = length(hiv_data) # Number of days observed throughout the outbreak
+#n = as.integer(N*10 + 1)
+pop = 66440000         # Population 
+sample_time=0:(N-1)
+sample_small_time=seq(from = 0, to =(N-1), length.out = 10*N+1 )
+n = length(sample_small_time)
+
+
+pred_days=N+1
+times_pred = seq(0, pred_days, by = 1)
+times_pred_small =seq(from = 0, to =pred_days, length.out = (pred_days+1)*10 +1 )
+n_pred_sm = length(times_pred_small)
+n_pred=length(times_pred)
+
+
+sample_y <- cbind(hiv_data,aids_data);
+
+# Modify data into a form suitable for Stan
+flu_data = list(n_obs = N,
+                n_small=n,
+                n_small_pred=n_pred_sm,
+                n_theta = 8,
+                n_difeq = 3,
+                n_pop = pop, #population
+                y = sample_y, 
+                t0 = -0.0000001,
+#                t0 = 0.0,
+                n_fake    = n_pred,
+                fake_ts   = times_pred_small,
+                tsm = sample_small_time,
+                ts = sample_time)
+
+# Specify parameters to monitor
+
+parameters = c("y_init", "theta", "fake","R_0")  #deterministic models (Model 1, Model 2)
+```
+
+In the context of a deterministic SIR, in order to estimate the transmission and the recovery rate, we use two different specifications and we fit the models using Stan's NUTS algorithm and the mean-field ADVI variant.
+
+## Model 1 - Poisson model
+
+Stan model statement:
+
+```{r stan_model1, echo=TRUE}
+mod1_stat <- '
+functions {
+  real[] SIR(real t,  // time
+  real[] y,           // system state {susceptible,infected,recovered}
+  real[] theta,       // parameters
+  real[] x_r,
+  int[] x_i) {
+  
+  real mu= 0.0115;
+  real nu= 0.0073;
+  real kappa  =  0.00003;
+  
+  real beta   = theta[1];
+  real sigma  = theta[2];
+  real Karga1 = theta[3];
+  real Karga2 = theta[4];
+  real xi1    = theta[5];
+  real xi2    = theta[6];  
+  
+  
+  real dy_dt[3];
+  
+  dy_dt[1] =  mu -(beta*y[2] + nu + xi1  )*y[1];
+  dy_dt[2]  =(beta* y[2] + xi1 ) *y[1] - (sigma + nu  - xi2)*y[2];
+  dy_dt[3] = (sigma -xi2)* y[2] - (kappa + nu)*y[3];
+  
+  return dy_dt;
+  }
+  
+  }
+  data {
+  
+  int<lower = 1> n_obs;       // number of days observed
+  int<lower = 1> n_small;       // number of days observed
+  int<lower = 1> n_small_pred;       // number of days observed
+  int<lower = 1> n_theta;     // number of model parameters
+  int<lower = 1> n_difeq;     // number of differential equations
+  int<lower = 1> n_pop;       // population 
+  int y[n_obs,(n_difeq-1)];           // data, total number of infected individuals each day
+  real t0;                // initial time point (zero)
+  real ts[n_obs];         // time points observed
+  real tsm[n_small];         // time points observed
+  int<lower = 1> n_fake; // This is to generate "predicted"/"unsampled" data
+  real fake_ts[n_small_pred]; // Time points for "predicted"/"unsampled" data
+  
+  }
+  
+  transformed data {
+  real x_r[0];
+  int x_i[0];
+  }
+  
+  parameters {
+  
+  real<lower =  0, upper = 2.5> beta ;
+  real<lower =  0, upper = 3.0> sigma ;
+  real<lower =  0, upper = 1.> Karga1 ;
+  real<lower =  0, upper = 1.> Karga2 ;
+  real<lower =  0, upper = 1e-2> xi1 ;
+  real<lower =  0, upper = 1> xi2 ;
+  real<lower =  0, upper = 1e-4> I0 ;
+  real<lower =  0, upper = 1e-4> A0 ;
+ 
+  }
+  
+  transformed parameters{
+  
+  real y_hat[n_obs,(n_difeq-1)]; // solution from the ODE solver
+  real y_hat_sm[n_small, n_difeq]; // solution from the ODE solver
+  real y_init[n_difeq];     // initial conditions for both fractions of S and I
+  real theta[n_theta];   // { alpha, beta, gamma, delta }
+  
+
+  real lambda1[n_obs];
+  real lambda2[n_obs];
+  real rho1[n_obs]; 
+  real rho2[n_obs];
+  vector[11] weights;
+  vector[11] incidence1;
+  vector[11] incidence2;
+  real dt=1./(10*n_obs);
+
+
+  
+
+  y_init[1] = 1-(I0 + A0);
+  y_init[2] = I0;
+  y_init[3] = A0;
+  
+  
+  theta[1] = beta;
+  theta[2] = sigma;
+  theta[3] = Karga1;
+  theta[4] = Karga2;
+  theta[5] = xi1;
+  theta[6] = xi2;
+  theta[7] = I0;
+  theta[8] = A0;
+
+  
+  y_hat_sm = integrate_ode_rk45(SIR, y_init, t0, tsm, theta, x_r, x_i);
+
+  
+ weights[1]=0.5;
+ weights[11]=0.5;
+ 
+ for (i in 2:10){
+     weights[i] = 1.0;
+  }
+
+ 
+  for (i in 1:n_obs){
+      lambda1[i] = 0.0;
+      lambda2[i] = 0.0;
+      for (k in 1:11){
+       incidence1[k] = (beta*y_hat_sm[k + 10*(i-1),2] + xi1 )*y_hat_sm[k + 10*(i-1),1];
+       incidence2[k] = ( sigma- xi2 )*y_hat_sm[k + 10*(i-1),2];
+       lambda1[i]    = lambda1[i] + dt*weights[k]*incidence1[k];
+       lambda2[i]    = lambda2[i] + dt*weights[k]*incidence2[k];
+      }
+  y_hat[i,1]=n_pop*Karga1*lambda1[i];
+  y_hat[i,2]=n_pop*Karga2*lambda2[i];
+ }
+    
+
+
+  }
+  
+  
+  model {
+  
+  real lamb1[n_obs];      //poisson parameter
+  real lamb2[n_obs];      //poisson parameter
+  real rhho1[n_obs];      //poisson parameter
+  real rhho2[n_obs];      //poisson parameter
+   
+  vector[11] weight;
+  vector[11] incid1;
+  vector[11] incid2;
+  real dtt=1./(10*n_obs);
+
+  
+  weight[1]=0.5;
+  weight[11]=0.5;
+
+
+  for (i in 2:10){
+     weight[i] = 1.0;
+  }
+  
+  //priors
+  beta     ~ lognormal(0, 2.5);
+  sigma    ~ uniform(0.0, 3. );
+  Karga1   ~ uniform(0.0, 1. );
+  Karga2   ~ uniform(0.0, 1.);
+  xi1      ~ uniform(0.0, 1e-2 );
+  xi2      ~ uniform(0.0, 1);
+  I0       ~ uniform(0.0, 1e-4 );
+  A0       ~ uniform(0.0, 1e-4 );  
+
+  
+  
+  //likelihood
+  for (i in 1:(n_obs)){
+      lamb1[i] = 0.0;
+      lamb2[i] = 0.0;
+      for (k in 1:11){
+       incid1[k] = ( beta*y_hat_sm[k + 10*(i-1),2] + xi1 )*y_hat_sm[k + 10*(i-1),1];
+       incid2[k] = ( sigma- xi2 )*y_hat_sm[k + 10*(i-1),2];       
+       lamb1[i]    = lamb1[i] +  dtt*weight[k]*incid1[k];
+       lamb2[i]    = lamb2[i] +  dtt*weight[k]*incid2[k];       
+      }
+ 
+  rhho1[i] = n_pop*Karga1*lamb1[i];
+  rhho2[i] = n_pop*Karga2*lamb2[i]; 
+  y[i , 1] ~ poisson(rhho1[i]);;
+  y[i , 2] ~ poisson(rhho2[i]);;
+  }
+ 
+  }
+  
+  generated quantities {
+  real R_0;      // Basic reproduction number
+  real nu= 0.0073;
+  real epsilon = 1e-9;
+  real fake[n_fake, 2];
+  real <lower = 0.> y_hat_pred[n_small_pred, n_difeq]; // Output from the ODE solver
+  
+  real lamb1[n_fake];      //poisson parameter
+  real lamb2[n_fake];      //poisson parameter
+  real rhho1[n_fake];      //poisson parameter
+  real rhho2[n_fake];      //poisson parameter
+   
+  vector[11] weight;
+  vector[11] incid1;
+  vector[11] incid2;
+  real dtt  =1./(10*n_fake);
+
+  
+  weight[1]=0.5;
+  weight[11]=0.5;
+
+
+  for (i in 2:10){
+     weight[i] = 1.0;
+  }
+  
+  y_hat_pred = integrate_ode_rk45(SIR, y_init, t0, fake_ts, theta, x_r, x_i);  
+  
+    //likelihood
+  for (i in 1:(n_fake)){
+      lamb1[i] = 0.0;
+      lamb2[i] = 0.0;
+      for (k in 1:11){
+       incid1[k] = ( theta[1]*y_hat_pred[k + 10*(i-1),2] + xi1 )*y_hat_pred[k + 10*(i-1),1];
+       incid2[k] = ( theta[2]- xi2 )*y_hat_pred[k + 10*(i-1),2];       
+       lamb1[i]   = lamb1[i] +  dtt*weight[k]*incid1[k];
+       lamb2[i]   = lamb2[i] +  dtt*weight[k]*incid2[k];       
+      }
+ 
+  rhho1[i]=n_pop*theta[3]*lamb1[i];
+  rhho2[i]=n_pop*theta[4]*lamb2[i];
+  fake[i , 1] = poisson_rng( rhho1[i] );
+  fake[i , 2] = poisson_rng( rhho2[i] );
+ 
+  }
+  
+  R_0 = theta[1]/(theta[2] + nu);
+  }
+'
+
+m1 <- stan_model(model_code = mod1_stat)
+```
+
+Fit and sample from the posterior using Hamiltonian Monte Carlo-NUTS:
+
+```{r NUTS_fit1, dependson=c(load_flu_data) , echo=FALSE}
+n_chains=6
+n_warmups=5000
+n_iter=10000
+n_thin=1
+set.seed(1234)
+# Set initial values:     
+
+ini_1 = function(){
+   list(theta=c(runif(1,0,2.5), runif(1,0,3.), runif(1,0,1), runif(1,0,1),
+                runif(1,0,1e-2), runif(1,0,1), 
+                runif(1,0,1e-4), runif(1,0,1e-4)
+                )  )   
+  }
+
+time.start_nuts1 <- Sys.time()
+nuts_fit_1 = sampling(m1, data = flu_data, pars = parameters, init = ini_1, chains = n_chains, algorithm = 'NUTS',warmup = n_warmups, iter = n_iter, thin=n_thin, seed=13219)
+time.end_nuts1 <- Sys.time()
+duration_nuts1<- time.end_nuts1 - time.start_nuts1
+  
+nuts_fit_1_summary <- summary(nuts_fit_1, pars = c("lp__", "theta[1]", "theta[2]",
+                                               "theta[3]", "theta[4]","theta[5]", "theta[6]","y_init")  )$summary
+print(nuts_fit_1_summary,scientific=TRUE,digits=4)
+posts_1 <-  rstan::extract(nuts_fit_1)
+```
+
+
+Check HMC diagnostics:
+
+```{r diagnostics1, echo=FALSE}
+mod1_diagnostics <-rstan::get_sampler_params(nuts_fit_1)
+
+# Check for divergent transitions
+rstan::check_divergences(nuts_fit_1)
+
+posterior_1 <- as.array(nuts_fit_1)
+color_scheme_set("viridis")
+# Markov chain traceplots
+mcmc_trace(posterior_1, pars="lp__")
+mcmc_trace(posterior_1, pars=c("theta[1]", "theta[2]","theta[3]",
+                               "theta[4]","theta[5]", "theta[6]",
+                               "y_init[2]", "y_init[3]") )
+
+
+# Univariate and bivariate marginal posterior distributions
+pairs(nuts_fit_1, pars = c("theta[1]", "theta[2]","theta[3]",
+                               "theta[4]","theta[5]", "theta[6]",
+                               "y_init[2]", "y_init[3]"), 
+      labels    = c("beta", "sigma","K1","K2","xi1","xi2","I0","A0"), 
+      cex.labels=1.5, font.labels=9, condition = "accept_stat__")  
+
+
+
+# Kernel density estimates of each Markov chain separately, overlaid
+mcmc_dens_overlay(posterior_1, pars=c("theta[1]", "theta[2]","theta[3]",
+                               "theta[4]","theta[5]", "theta[6]",
+                               "y_init[2]", "y_init[3]") )
+
+#Central posterior uncertainty intervals
+mcmc_intervals(posterior_1,pars = c("theta[1]"),prob_outer = 0.95)
+mcmc_intervals(posterior_1,pars = c("theta[2]"),prob_outer = 0.95)
+mcmc_intervals(posterior_1,pars = c("theta[3]"),prob_outer = 0.95)
+mcmc_intervals(posterior_1,pars = c("theta[4]"),prob_outer = 0.95)
+```
+
+
+
+```{r plot_nuts_fit1, echo=FALSE}
+HIV_people   =data.frame(hiv_data)
+AIDS_people  =data.frame(aids_data)
+```
+
+
+
+```{r plot_advi_1, echo=FALSE}
+# Model fitted values across the observed time period
+#library(gridExtra)
+fit_I <- posts_1$fake[,,1]
+fit_SIR_I <- fit_I
+median_I = apply(fit_SIR_I, 2, median)
+low_I = apply(fit_SIR_I, 2, quantile, probs=c(0.025))
+high_I = apply(fit_SIR_I, 2, quantile, probs=c(0.975))
+df_fit_I = data.frame(median_I, low_I, high_I, times_pred)
+
+fit_A <- posts_1$fake[,,2]
+fit_SIR_A <- fit_A
+median_A = apply(fit_SIR_A, 2, median)
+low_A = apply(fit_SIR_A, 2, quantile, probs=c(0.025))
+high_A = apply(fit_SIR_A, 2, quantile, probs=c(0.975))
+df_fit_A = data.frame(median_A, low_A, high_A, times_pred)
+#save(df_fit_I_vb_1,file="df_I_det_Poiss_vb.Rda")
+
+#df_sample_N = data.frame(hiv_data, sample_time)  
+
+ggplot() +
+  geom_ribbon(aes(x=times_pred, ymin = low_I, ymax = high_I), fill = "orange", alpha = 0.6) +
+  geom_point(data = HIV_people, aes(x=sample_time, y=hiv_data) ,shape = 19, size = 1.5) +
+  geom_line(data = df_fit_I, aes(x=times_pred, y=median_I, color = "Median"), size = 1.1) +
+  scale_colour_manual(name='', values=c('Data'='black', 'Median'='darkorange3'))+
+#  guides(colour = guide_legend(override.aes = list(shape=c(16,NA), linetype=c(0,1))))+
+#  theme_bw()+theme(text = element_text(size=20))+
+  
+  geom_ribbon(aes(x=times_pred, ymin = low_A, ymax = high_A), fill = "orange", alpha = 0.6) +
+  geom_point(data = AIDS_people, aes(x=sample_time, y=aids_data) ,shape = 19, size = 1.5) +
+  geom_line(data = df_fit_A, aes(x=times_pred, y=median_A, color = "Median"), size = 1.1) +
+  scale_colour_manual(name='', values=c('Data'='black', 'Median'='darkorange3'))+
+#  guides(colour = guide_legend(override.aes = list(shape=c(16,NA), linetype=c(0,1))))+
+  labs(x = "Time (days)", y = "HIV-AIDS cases ") + 
+  scale_x_continuous(limits=c(0, 30)) +
+  scale_y_continuous(limits=c(0,8000)) +
+  theme_bw()+theme(text = element_text(size=20))
+  
+ 
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Approximate the posterior using ADVI(mean-field):
+
+```{r ADVI_1, dependson=c(load_flu_data), echo=FALSE}
+set.seed(1234)
+# Set initial values:
+
+ini_vb_1 = function(){
+   list(theta=c(runif(1,0,1), runif(1,0,1), runif(1,0,30), runif(1,0,30),
+                runif(1,0,1e-2), runif(1,0,1e-3), 
+                runif(1,0,8e-5), runif(1,0,8e-5)
+                )  )   
+  }
+
+#init = ini_vb_1
+time.start_vb_1 <- Sys.time()
+vb_fit_1=vb(m1, data = flu_data, pars = parameters , iter = 50000,algorithm="meanfield", tol_rel_obj = 0.001, seed=16735673)
+time.end_vb_1 <- Sys.time()
+vb_duration_1 <- time.end_vb_1 - time.start_vb_1
+
+vb_fit_1_summary <- summary(vb_fit_1, pars = c("lp__", "theta[1]", "theta[2]",
+                                               "theta[3]", "theta[4]","theta[5]", "theta[6]","y_init") )$summary
+print(vb_fit_1_summary,scientific=FALSE,digits=4)
+posts_vb_1 <-  rstan::extract(vb_fit_1)
+```
+
+Plot model fit, median and 95% credible interval:
+
+
+```{r plot_nuts_fit1, echo=FALSE}
+HIV_people   =data.frame(hiv_data)
+AIDS_people  =data.frame(aids_data)
+```
+
+
+
+
+```{r plot_advi_1, echo=FALSE}
+# Model fitted values across the observed time period
+#library(gridExtra)
+fit_I <- posts_vb_1$fake[,,1]
+fit_SIR_vb_I <- fit_I
+median_I = apply(fit_SIR_vb_I, 2, median)
+low_I = apply(fit_SIR_vb_I, 2, quantile, probs=c(0.025))
+high_I = apply(fit_SIR_vb_I, 2, quantile, probs=c(0.975))
+df_fit_I = data.frame(median_I, low_I, high_I, times_pred)
+
+fit_A <- posts_vb_1$fake[,,2]
+fit_SIR_vb_A <- fit_A
+median_A = apply(fit_SIR_vb_A, 2, median)
+low_A = apply(fit_SIR_vb_A, 2, quantile, probs=c(0.025))
+high_A = apply(fit_SIR_vb_A, 2, quantile, probs=c(0.975))
+df_fit_A = data.frame(median_A, low_A, high_A, times_pred)
+#save(df_fit_I_vb_1,file="df_I_det_Poiss_vb.Rda")
+
+#df_sample_N = data.frame(hiv_data, sample_time)  
+
+ggplot() +
+  geom_ribbon(aes(x=times_pred, ymin = low_I, ymax = high_I), fill = "orange", alpha = 0.6) +
+  geom_point(data = HIV_people, aes(x=sample_time, y=hiv_data) ,shape = 19, size = 1.5) +
+  geom_line(data = df_fit_I, aes(x=times_pred, y=median_I, color = "Median"), size = 1.1) +
+  scale_colour_manual(name='', values=c('Data'='black', 'Median'='darkorange3'))+
+#  guides(colour = guide_legend(override.aes = list(shape=c(16,NA), linetype=c(0,1))))+
+#  theme_bw()+theme(text = element_text(size=20))+
+  
+  geom_ribbon(aes(x=times_pred, ymin = low_A, ymax = high_A), fill = "light blue", alpha = 0.6) +
+  geom_point(data = AIDS_people, aes(x=sample_time, y=aids_data) ,shape = 19, size = 1.5) +
+  geom_line(data = df_fit_A, aes(x=times_pred, y=median_A, color = "Median"), size = 1.1) +
+  scale_colour_manual(name='', values=c('Data'='red', 'Median'='darkorange3'))+
+#  guides(colour = guide_legend(override.aes = list(shape=c(16,NA), linetype=c(0,1))))+
+  labs(x = "Time (days)", y = "HIV-AIDS cases ") + 
+  scale_x_continuous(limits=c(0, 30)) +
+  scale_y_continuous(limits=c(0,8000)) +
+  theme_bw()+theme(text = element_text(size=20))
+  
+ 
+```
+
+
+```{r plot_advi_1, echo=FALSE}
+# Model fitted values across the observed time period
+#library(gridExtra)
+fit_I <- posts_vb_1$fake[,,1]
+fit_SIR_vb_I <- fit_I
+median_I = apply(fit_SIR_vb_I, 2, median)
+low_I = apply(fit_SIR_vb_I, 2, quantile, probs=c(0.025))
+high_I = apply(fit_SIR_vb_I, 2, quantile, probs=c(0.975))
+df_fit_I = data.frame(median_I, low_I, high_I, times_pred)
+
+fit_A <- posts_vb_1$fake[,,2]
+fit_SIR_vb_A <- fit_A
+median_A = apply(fit_SIR_vb_A, 2, median)
+low_A = apply(fit_SIR_vb_A, 2, quantile, probs=c(0.025))
+high_A = apply(fit_SIR_vb_A, 2, quantile, probs=c(0.975))
+df_fit_A = data.frame(median_A, low_A, high_A, times_pred)
+#save(df_fit_I_vb_1,file="df_I_det_Poiss_vb.Rda")
+
+#df_sample_N = data.frame(hiv_data, sample_time)
+
+ggplot() +
+   geom_point(data = HIV_people, aes(x=sample_time, y=hiv_data,color="black") ,shape = 19, size = 1.5) +
+  geom_ribbon(aes(x=times_pred, ymin = low_I, ymax = high_I), fill = "orange", alpha = 0.6) +
+
+  geom_line(data = df_fit_I, aes(x=times_pred, y=median_I, color = "Median"), size = 1.1) +
+   
+#  scale_colour_manual(name='', values=c('Data'='black', 'Median'='darkorange3'))+
+#  guides(colour = guide_legend(override.aes = list(shape=c(16,NA), linetype=c(0,1))))+
+#  theme_bw()+theme(text = element_text(size=20))+
+  
+  geom_ribbon(aes(x=times_pred, ymin = low_A, ymax = high_A), fill = "light blue", alpha = 0.6) +
+  geom_point(data = AIDS_people, aes(x=sample_time, y=aids_data,color="black") ,shape = 19, size = 1.5) +
+  geom_line(data = df_fit_A, aes(x=times_pred, y=median_A, color = "Median"), size = 1.1) +
+  scale_colour_manual(name='', values=c('Data'='black', 'Median'='darkblue'))+
+#  guides(colour = guide_legend(override.aes = list(shape=c(16,NA), linetype=c(0,1))))+
+  labs(x = "Time (days)", y = "HIV-AIDS cases ") + 
+  scale_x_continuous(limits=c(0, 26)) +
+  scale_y_continuous(limits=c(0,8000)) +
+  theme_bw()+theme(text = element_text(size=20))
+  
+ 
+```
+
+
+
+```{r plot_advi_1, echo=FALSE}
+# Model fitted values across the observed time period
+fit_A <- posts_vb_1$y_hat[,,2]
+fit_SIR_vb_A <- fit_A
+median_A = apply(fit_SIR_vb_A, 2, median)
+low_A = apply(fit_SIR_vb_A, 2, quantile, probs=c(0.025))
+high_A = apply(fit_SIR_vb_A, 2, quantile, probs=c(0.975))
+df_fit_A = data.frame(median_A, low_A, high_A, sample_time)
+#save(df_fit_I_vb_1,file="df_I_det_Poiss_vb.Rda")
+
+df_sample_N = data.frame(aids_data, sample_time)
+
+ggplot(df_sample_N, aes(x=sample_time, y=aids_data)) +
+  geom_ribbon(aes(x=sample_time, ymin = low_A, ymax = high_A), fill = "light green", alpha = 0.6) +
+  geom_line(data = df_fit_A, aes(x=sample_time, y=median_A, color = "Median"), size = 1.3) +
+  geom_point(shape = 19, size = 3, (aes(color="Data"))) +
+  scale_colour_manual(name='', values=c('Data'='black', 'Median'='darkorange3'))+
+  guides(colour = guide_legend(override.aes = list(shape=c(16,NA), linetype=c(0,1))))+
+  labs(x = "Time (days)", y = "AIDS students") + 
+  scale_x_continuous(limits=c(0, 35)) +
+  scale_y_continuous(limits=c(0,100)) +
+  theme_bw()+theme(text = element_text(size=20))
+```
+
+
+
+
+```{r plot_advi_1, echo=FALSE}
+# Model fitted values across the observed time period
+fit_I_vb_1 <- posts_vb_1$y_hat
+fit_SIR_vb_1 <- fit_I_vb_1
+median_I_vb_1 = apply(fit_SIR_vb_1, 2, median)
+low_I_vb_1 = apply(fit_SIR_vb_1, 2, quantile, probs=c(0.025))
+high_I_vb_1 = apply(fit_SIR_vb_1, 2, quantile, probs=c(0.975))
+df_fit_I_vb_1 = data.frame(median_I_vb_1, low_I_vb_1, high_I_vb_1, sample_time)
+#save(df_fit_I_vb_1,file="df_I_det_Poiss_vb.Rda")
+
+df_sample_N = data.frame(hiv_data, sample_time)
+
+ggplot(df_sample_N, aes(x=sample_time, y=hiv_data)) +
+  geom_ribbon(aes(x=sample_time, ymin = low_I_vb_1, ymax = high_I_vb_1), fill = "light green", alpha = 0.6) +
+  geom_line(data = df_fit_I_vb_1, aes(x=sample_time, y=median_I_vb_1, color = "Median"), size = 1.3) +
+  geom_point(shape = 19, size = 3, (aes(color="Data"))) +
+  scale_colour_manual(name='', values=c('Data'='black', 'Median'='darkorange3'))+
+  guides(colour = guide_legend(override.aes = list(shape=c(16,NA), linetype=c(0,1))))+
+  labs(x = "Time (days)", y = "Number of Infected students") + 
+  scale_x_continuous(limits=c(0, 35)) +
+  scale_y_continuous(limits=c(0,100)) +
+  theme_bw()+theme(text = element_text(size=20))
+```
+
+
+The resulting 95$\%$ credible intervals from ADVI have shorter length compared to NUTS.
+Also, adding stochasticity improves the fit to the data.
+
+
+Summing up, the results of both the deterministic and the stochastic setting bring us to the preliminary conclusion that if we are interested in real-time inference both methods are feasible and efficient. In terms of computational time ADVI is extremely efficient.
